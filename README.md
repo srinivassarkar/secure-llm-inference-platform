@@ -76,7 +76,11 @@ flowchart TD
 
 ### Plane 3: Autoscaling & SRE Control Plane (KEDA & Prometheus)
 * **Leading-Signal Autoscaling:** Evaluates real-time slot saturation:
-  $$\text{Saturation Ratio} = \frac{\sum \text{requests\_running} + \sum \text{requests\_waiting}}{\text{Replica Count} \times \text{Slots Per Replica}}$$
+```text
+                          sum(requests_running) + sum(requests_waiting)
+Saturation Ratio  =  -------------------------------------------------------
+                             Total Replicas  x  Slots Per Replica
+```
 * **The Scaling Lag Waterfall:** Quantifies the 7 physical delays during pod provisioning:
   - Metric Scrape Delay: 1.0 - 5.0 s
   - KEDA Polling Interval: 5.0 s
@@ -90,7 +94,60 @@ flowchart TD
 
 ---
 
-## 4. Engineering Integrity & Methodology Framework
+---
+
+## 4. End-to-End 3-Tier Application Architecture
+
+To provide an immediate, visually verifiable proof-of-work before executing cluster-wide autoscaling, the platform includes a self-contained 3-tier reference application:
+
+```
++-------------------------------------------------------------------------------------------------------+
+|                                      3-TIER APPLICATION TOPOLOGY                                      |
++-------------------------------------------------------------------------------------------------------+
+| TIER 1: CLIENT FRONTEND (Web Chat UI & Python CLI)                                                    |
+| - Browser-based Web Chat UI (HTML5/Vanilla JS) and streaming Python CLI (`client.py`).                |
+| - Performs client-side ephemeral X25519 key generation & AES-256-GCM prompt encryption.              |
+| - Renders real-time streaming tokens and displays the live Ed25519 Cryptographic Verification Badge.  |
++-------------------------------------------------------------------------------------------------------+
+                                                |  (Encrypted Ciphertext: X25519 + AES-256-GCM)
+                                                v
++-------------------------------------------------------------------------------------------------------+
+| TIER 2: CITADEL INGRESS GATEWAY (Security & Telemetry Proxy)                                          |
+| - Containerized Python AsyncIO proxy daemon configured via `.env`.                                    |
+| - In-memory ephemeral decryption in `/dev/shm` tmpfs (zero disk writes).                              |
+| - Listens for client disconnects and triggers cancellation propagation to vLLM.                       |
+| - Exposes Prometheus `/metrics` on port 9090 (TTFT & TPOT latency histograms).                         |
+| - Injects signed `X-Citadel-Audit-Receipt` header into response stream.                               |
++-------------------------------------------------------------------------------------------------------+
+                                                |  (OpenAI-Compatible Stream over Private Pod Network)
+                                                v
++-------------------------------------------------------------------------------------------------------+
+| TIER 3: ACCELERATED INFERENCE ENGINE (vLLM Backend)                                                   |
+| - Containerized vLLM serving engine on CUDA (or CPU fallback for local development).                  |
+| - Primary Model: Ultra-fast tiny model (`Qwen/Qwen2.5-Coder-0.5B-Instruct` or `SmolLM2-360M`).        |
+| - Lightning-fast container builds (< 500 MB footprint) and instant sub-2.5s cold starts.              |
+| - Exposes engine metrics on port 8000 (`/metrics`: `vllm:num_requests_running`, requests_waiting).     |
++-------------------------------------------------------------------------------------------------------+
+```
+
+### Local Docker Compose Verification (Test Before Cluster Deployment)
+Before deploying to Kubernetes, verify the entire 3-tier stack locally in Docker:
+```bash
+# 1. Configure environment
+cp .env.example .env
+
+# 2. Build and launch all 3 tiers (Web UI + Gateway + Fast 0.5B Model)
+docker compose up --build
+
+# 3. Access endpoints:
+#    - Web Chat UI:        http://localhost:3000
+#    - Citadel Gateway:    http://localhost:8080/v1/chat/completions
+#    - Prometheus Metrics: http://localhost:9090/metrics
+#    - vLLM Raw Backend:   http://localhost:8000/metrics
+```
+Once local streaming, in-memory decryption, and signed receipt headers pass verification, the identical container images are deployed directly into Kubernetes pods (`deploy/vllm/` and `deploy/gateway/`).
+
+## 5. Engineering Integrity & Methodology Framework
 
 Every metric, latency figure, and throughput claim in this repository adheres to the **M/D/B Framework**:
 
@@ -109,7 +166,7 @@ Every metric, latency figure, and throughput claim in this repository adheres to
 
 ---
 
-## 5. Repository Layout
+## 6. Repository Layout
 
 ```
 secure-llm-inference-platform/
@@ -138,7 +195,7 @@ secure-llm-inference-platform/
 
 ---
 
-## 6. Verification & Quickstart
+## 7. Verification & Quickstart
 
 ### Prerequisites
 * Kubernetes Cluster: `k3s` (v1.28+) or `kind` with NVIDIA Container Toolkit.
@@ -175,7 +232,7 @@ make results
 
 ---
 
-## 7. Scope and Boundaries
+## 8. Scope and Boundaries
 
 * **No Synthetic Embellishment:** If a test is run with simulated mock replicas or edge silicon, it is labeled with a visible boundary tag. Headline scaling figures reflect real NVIDIA GPU execution.
 * **Confidentiality Scope:** The Zero-Disk Gateway provides application-layer envelope encryption and RAM-only zero-persistence on host nodes. It does not replace hardware confidential computing (AMD SEV-SNP / Intel TDX).
