@@ -64,10 +64,12 @@ flowchart TD
 ## 3. The Three Physical Planes
 
 ### Plane 1: Confidential Ingress Data Plane (Citadel Gateway)
-* **Application-Layer Envelope Encryption:** Clients generate an ephemeral Curve25519 keypair, derive a shared symmetric key via ECDH (HKDF-SHA256), and encrypt request payloads with AES-256-GCM.
-* **Zero-Persistence Guarantee:** All decryption occurs in an isolated memory buffer backed by `/dev/shm` (tmpfs). Linux audit tests (`lsof`, `fuser`, swap accounting) verify zero disk writes. Memory buffers are zeroized (`b"\x00" * len`) immediately after streaming begins.
-* **Cancellation Propagation:** When a client aborts an SSE stream or closes their TCP connection, the Gateway intercepts the event and asynchronously signals vLLM's `/v1/abort` endpoint, immediately freeing allocated KV cache blocks and preventing up to 40% of wasted GPU compute.
-* **Cryptographic Audit Receipts:** Every transaction returns an Ed25519-signed header (`X-Citadel-Audit-Receipt`) validating the timestamp, transaction digest, and zero-disk execution state without revealing prompt content.
+* **Application-Layer Envelope Encryption:** Clients generate an ephemeral Curve25519 keypair, derive a shared symmetric key via ECDH (HKDF-SHA256), and encrypt request payloads with AES-256-GCM (including nonce uniqueness and replay window checks).
+* **Zero-Persistence Guarantee:** All decryption occurs in an isolated memory buffer backed strictly by `/dev/shm` (tmpfs). Buffers are allocated as mutable `bytearray` / `ctypes.create_string_buffer` and zeroized in-place via `ctypes.memset`, with `mlock` invoked to prevent kernel paging to swap. Linux audit tests (`lsof`, `fuser`, swap accounting) verify zero disk writes.
+* **Cancellation Propagation:** When a client aborts an SSE stream or closes their TCP socket, the Gateway detects `connection_lost` and immediately terminates the upstream streaming socket to vLLM. vLLM's native disconnect listener (`request.is_disconnected()`) detects the socket drop and triggers its internal `engine.abort(request_id)` handler, freeing allocated PagedAttention KV blocks immediately.
+* **Overload Protection & Admission Control:** Implements bounded request queues (`asyncio.Queue(maxsize=128)`), maximum concurrent streams, and rapid 503 shedding (`Retry-After`) to prevent gateway buffer bloat while protecting vLLM from queue collapse.
+* **Cryptographic Audit Receipts:** Every transaction returns an Ed25519-signed header (`X-Citadel-Audit-Receipt`) attesting to timestamp, request ciphertext hash, and zero-disk execution state.
+* **Network Isolation Boundary:** Decrypted plaintext travels strictly across the private Kubernetes pod overlay network to vLLM (isolated via Kubernetes NetworkPolicies). This enforces Application-Layer Confidential Ingress; it does not replace hardware confidential computing (AMD SEV-SNP / Intel TDX).
 
 ### Plane 2: Accelerated Inference Fleet (vLLM on CUDA)
 * **High-Throughput Serving:** Deployed on enterprise NVIDIA silicon (L4 / RTX 4090 / A10G) using **PagedAttention** to eliminate external memory fragmentation.
@@ -155,13 +157,13 @@ Every metric, latency figure, and throughput claim in this repository adheres to
 * **[D] Derived:** Calculated from first-principles systems formulas (e.g. arithmetic intensity, VRAM sizing, scaling lag sums).
 * **[B] Borrowed:** Sourced from published peer-reviewed research (e.g. vLLM PagedAttention paper, Google SRE Handbook).
 
-| Metric Category | Target SLO / Benchmark | Verification Standard | Methodology Tag |
+| Metric Category | Engineering Objective / Formula | Verification Standard | Methodology Classification |
 | :--- | :---: | :---: | :---: |
-| **Time to First Token (TTFT)** | $P_{95} \le 350\ \mathrm{ms}$ | Open-Loop k6 Ramping Load | **[M] Measured** |
-| **Inter-Token Latency (TPOT)** | $P_{99} \le 35\ \mathrm{ms}$ ($> 28.5\ \text{tok/s}$) | Gateway Telemetry Exposition | **[M] Measured** |
-| **Zero-Disk Persistence** | 0 Disk Bytes Written | Linux I/O & `/dev/shm` Audit | **[M] Measured** |
-| **Scaling Lag Duration** | $30.5\ \mathrm{s} - 38.5\ \mathrm{s}$ | Pod Lifecycle Timestamp Overlay | **[M] Measured** |
-| **KV Cache Memory Footprint** | $2 \times L \times H_{\mathrm{kv}} \times D \times 2\ \text{bytes}$ | First-Principles Formula | **[D] Derived** |
+| **Time to First Token (TTFT)** | $P_{95} \le 350\ \mathrm{ms}$ | Open-Loop k6 Ramping Load | **[Target Hypothesis]** *(Pending execution)* |
+| **Inter-Token Latency (TPOT)** | $P_{99} \le 35\ \mathrm{ms}$ ($> 28.5\ \text{tok/s}$) | Gateway Telemetry Exposition | **[Target Hypothesis]** *(Pending execution)* |
+| **Zero-Disk Persistence** | 0 Disk Bytes Written in `/dev/shm` | Linux I/O & `/dev/shm` Audit | **[Target Hypothesis]** *(Pending audit)* |
+| **Scaling Lag Duration** | $30.5\ \mathrm{s} - 38.5\ \mathrm{s}$ (Pre-warmed Node) | 7-Step Latency Interval Sum | **[D] Derived** *(To be measured via pod timestamps)* |
+| **KV Cache Memory Footprint** | $2 \times L \times H_{\mathrm{kv}} \times D \times 2\ \text{bytes}$ | First-Principles Attention Formula | **[D] Derived** |
 | **PagedAttention Efficiency** | $< 4\%$ Internal Fragmentation | vLLM Architectural Specification | **[B] Borrowed** |
 
 ---

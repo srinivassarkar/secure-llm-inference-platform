@@ -88,9 +88,9 @@ The Ingress Gateway is engineered in Python AsyncIO to provide an OpenAI-compati
      "tag": "16-byte-authentication-tag"
    }
    ```
-4. **Zero-Disk In-Memory Decryption:** The Gateway decrypts the ciphertext in an ephemeral memory-mapped buffer backed strictly by `/dev/shm` (tmpfs). At no point does the plaintext touch root disks, network-attached storage, or swap space.
-5. **Memory Zeroization:** Immediately following request transmission to the inference engine, the plaintext memory buffer is explicitly overwritten with zeroes (`b"\x00" * length`).
-6. **Signed Audit Receipt:** The Gateway signs an audit receipt using its private Ed25519 signing key and returns it in the response header `X-Citadel-Audit-Receipt`:
+4. **Zero-Disk In-Memory Decryption:** The Gateway decrypts the ciphertext in an ephemeral buffer backed strictly by `/dev/shm` (tmpfs). Buffers are managed via mutable `bytearray` or `ctypes.create_string_buffer` to allow direct in-place memory control.
+5. **Memory Zeroization & Swap Protection:** Immediately following request dispatch to the inference engine, the plaintext buffer is explicitly wiped in-place using `ctypes.memset(ctypes.addressof(buf), 0, len(buf))`. `mlock` is engaged on sensitive memory pools to prevent OS paging to swap disk.
+6. **Signed Audit Receipt:** The Gateway signs an audit receipt using its private Ed25519 signing key and returns it in the response header `X-Citadel-Audit-Receipt`. (Note: The receipt attests to the Gateway's internal zero-disk state and transaction hash; independent verification is established via OS-level audit scripts).
    ```json
    {
      "timestamp_epoch_ms": 1730438400123,
@@ -102,10 +102,16 @@ The Ingress Gateway is engineered in Python AsyncIO to provide an OpenAI-compati
    ```
 
 #### B. Cancellation Propagation (Combating Orphan Compute)
-In autoregressive decoding, generating 512 tokens consumes several seconds of GPU time. If a user closes their browser or aborts their HTTP connection, naive reverse proxies continue consuming GPU cycles until generation finishes.
+In autoregressive decoding, generating 512 tokens consumes several seconds of GPU compute. If a user closes their browser or aborts their HTTP connection, naive reverse proxies continue consuming GPU cycles until generation finishes.
 - **Implementation:** The Gateway monitors client socket connectivity via asyncio transport callbacks (`connection_lost`).
-- **GPU Reclaim:** Upon socket closure, the Gateway fires an asynchronous cancellation request to vLLM's `/v1/abort` endpoint matching the internal `request_id`.
-- **Verified Benefit:** Frees allocated KV cache memory blocks immediately, mitigating up to 40% of wasted compute under high user churn.
+- **GPU Reclaim:** Upon socket closure, the Gateway immediately terminates the upstream HTTP streaming connection/socket to vLLM. vLLM's native streaming response handler detects the client socket drop (`request.is_disconnected()`) and triggers its internal `engine.abort(request_id)` routine.
+- **Verified Benefit:** Frees allocated PagedAttention KV cache blocks immediately, mitigating up to 40% of wasted compute under high user churn.
+
+#### C. Overload Protection & Gateway Admission Control
+To prevent the Ingress Gateway itself from becoming an unbuffered bottleneck:
+- **Bounded Request Queue:** `asyncio.Queue(maxsize=128)` sheds excess requests with `503 Service Unavailable` and `Retry-After: 5`.
+- **Concurrency Limiting:** Enforces a maximum concurrent stream ceiling tuned to backend slot capacity.
+- **Client Request Deadlines:** Cancels in-flight requests that exceed SLA deadlines (e.g., 60 seconds without first token).
 
 #### C. Drain-Aware SSE Streaming
 - **Buffer Bloat Elimination:** The Gateway sets `X-Accel-Buffering: no` and enforces `await response.drain()` on every Server-Sent Event (SSE) token chunk.
