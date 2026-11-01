@@ -76,9 +76,12 @@ The **Secure LLM Inference Platform** bridges this divide by delivering:
 
 The Ingress Gateway is engineered in Python AsyncIO to provide an OpenAI-compatible `/v1/chat/completions` interface while enforcing zero-trust data governance.
 
-#### A. Cryptographic Protocol Specification
-1. **Key Agreement:** The client generates an ephemeral Curve25519 (X25519) keypair. Using the Gateway's public key, the client computes a shared secret via Elliptic Curve Diffie-Hellman (ECDH).
-2. **Key Derivation:** The shared secret is passed through HKDF-SHA256 with a client-supplied salt to produce a 256-bit symmetric encryption key.
+#### A. Cryptographic Protocol Specification & Key Management
+1. **Gateway Public-Key Authentication:** The Gateway distributes its X25519 public key accompanied by an Ed25519 digital signature generated from a long-term root identity key (or via authenticated TLS trust bundle), preventing Man-In-The-Middle (MITM) key substitution.
+2. **Key Lifecycle & Rotation:** The Gateway rotates ephemeral session keypairs periodically (e.g., hourly) and publishes signed rotation manifests.
+3. **Key Agreement:** The client generates an ephemeral Curve25519 (X25519) keypair. Using the verified Gateway public key, the client computes a shared secret via Elliptic Curve Diffie-Hellman (ECDH).
+4. **Key Derivation:** The shared secret is passed through HKDF-SHA256 with a client-supplied salt and request context to produce a 256-bit symmetric encryption key.
+5. **Nonce Uniqueness & Replay Defense:** The Gateway maintains an in-memory sliding-window TTL cache of observed nonces. Requests with duplicate nonces or timestamps drifting beyond 60 seconds are rejected immediately with `401 Unauthorized`.
 3. **Payload Decryption:** The HTTP request body contains:
    ```json
    {
@@ -121,7 +124,22 @@ To prevent the Ingress Gateway itself from becoming an unbuffered bottleneck:
 
 ### 3.2 Plane 2: Accelerated Inference Plane (vLLM Engine)
 
-#### A. Architecture & Quantization
+#### A. KV Cache Memory Mathematical Specification
+The KV cache memory consumption for an autoregressive sequence is defined by first principles:
+\[
+M_{\mathrm{KV}} = 2 \times L \times H_{\mathrm{kv}} \times D \times S \times B
+\]
+Where:
+- \(L\): Number of transformer layers.
+- \(H_{\mathrm{kv}}\): Number of Key-Value heads (accounting for Grouped-Query Attention).
+- \(D\): Head dimension (\(d_{\mathrm{model}} / H_q\)).
+- \(S\): Number of cached sequence tokens.
+- \(B\): Bytes per element (2 bytes for FP16/BF16, 1 byte for FP8).
+- Factor \(2\): Separate Key and Value tensors.
+
+For \(N\) concurrent active sequences, total VRAM demand is the sum of cached tokens across all sequences: \(M_{\mathrm{total}} = \sum_{i=1}^{N} M_{\mathrm{KV}}^{(i)}\).
+
+#### B. Architecture & Serving Engine
 The inference fleet is powered by **vLLM** hosted on NVIDIA GPU silicon (L4 / RTX 4090 / A10G):
 - **PagedAttention:** Virtual memory paging for KV cache memory, eliminating external memory fragmentation and reducing internal fragmentation to $< 4\%$.
 - **Continuous Batching:** Dynamic iteration-level scheduling combining newly arriving prefill requests with active decode iterations.
@@ -238,17 +256,19 @@ groups:
 
 ---
 
-## 5. Day-by-Day Implementation Roadmap
+## 5. Phased Implementation Roadmap
 
-```
-Day 0: Project Setup, Repository Architecture & M/D/B Standards
-Day 1: Accelerated vLLM Engine Deployment & Silicon Baseline
-Day 2: Citadel Confidential Ingress Gateway (X25519, AES-GCM, Zero-Disk Audit)
-Day 3: Kubernetes Orchestration & Observability (k3s, Helm, Prometheus)
-Day 4: KEDA Leading-Signal Autoscaling & Open-Loop Burst Tests (k6)
-Day 5: Chaos Engineering Suite (SIGSTOP Gray Failure, SIGKILL MTTR, Client Stalls)
-Day 6: Final Verification, Blameless Postmortem & Executive Packaging
-```
+To maintain rigorous experimental attribution, we establish baseline metrics at each layer before introducing the next:
+
+| Phase | Engineering Deliverable | Verification & Exit Criterion |
+| :--- | :--- | :--- |
+| **Phase 1** | vLLM Serving + Client Streaming | Measure raw baseline TTFT/TPOT on OpenAI-compatible endpoint. |
+| **Phase 2** | Citadel Cryptographic Gateway | Benchmark encryption/decryption overhead against Phase 1 baseline. |
+| **Phase 3** | Admission Control & Cancellation | Verify bounded queue 503 shedding and socket drop GPU aborts. |
+| **Phase 4** | Zero-Persistence Security Auditing | Pass automated `/dev/shm`, swap, and container layer audit scripts. |
+| **Phase 5** | Prometheus Metrics & Grafana Dashboard | Expose and visualize TTFT/TPOT histograms and slot saturation. |
+| **Phase 6** | Kubernetes Deployment & KEDA Autoscaler | Reproduce 1 -> 2 -> 4 pod scale-out under leading PromQL trigger. |
+| **Phase 7** | Chaos Fault Injection & k6 Benchmarks | Document TTD and MTTR under SIGKILL, SIGSTOP, and client stalls. |
 
 ---
 
