@@ -77,11 +77,13 @@ The **Secure LLM Inference Platform** bridges this divide by delivering:
 The Ingress Gateway is engineered in Python AsyncIO to provide an OpenAI-compatible `/v1/chat/completions` interface while enforcing zero-trust data governance.
 
 #### A. Cryptographic Protocol Specification & Key Management
-1. **Gateway Public-Key Authentication:** The Gateway distributes its X25519 public key accompanied by an Ed25519 digital signature generated from a long-term root identity key (or via authenticated TLS trust bundle), preventing Man-In-The-Middle (MITM) key substitution.
-2. **Key Lifecycle & Rotation:** The Gateway rotates ephemeral session keypairs periodically (e.g., hourly) and publishes signed rotation manifests.
+1. **Gateway Public-Key Authentication & Certificate Binding:** Clients obtain and trust the Gateway's root Ed25519 identity key via secure out-of-band TLS/bootstrap. The Gateway's ephemeral X25519 public key is authenticated via an Ed25519-signed manifest binding the gateway identity, timestamp, and a 1-hour expiration window: `Sign(Ed25519_priv, gateway_id || x25519_pub || expiry || nonce)`. Handshake transcripts and negotiated parameters are cryptographically authenticated to prevent MITM key substitution.
+2. **Key Lifecycle & Rotation:** The Gateway rotates ephemeral session keypairs periodically (hourly) and publishes signed rotation manifests with explicit revocation support.
 3. **Key Agreement:** The client generates an ephemeral Curve25519 (X25519) keypair. Using the verified Gateway public key, the client computes a shared secret via Elliptic Curve Diffie-Hellman (ECDH).
 4. **Key Derivation:** The shared secret is passed through HKDF-SHA256 with a client-supplied salt and request context to produce a 256-bit symmetric encryption key.
 5. **Nonce Uniqueness & Replay Defense:** The Gateway maintains an in-memory sliding-window TTL cache of observed nonces. Requests with duplicate nonces or timestamps drifting beyond 60 seconds are rejected immediately with `401 Unauthorized`.
+6. **Zero-Persistence Property & Memory Scope:** Decryption is performed using explicitly managed memory buffers backed by tmpfs (`/dev/shm`). The gateway minimizes plaintext persistence and performs in-place buffer wiping where supported (using mutable `bytearray` / `ctypes.create_string_buffer` and `ctypes.memset`). The zero-persistence claim is limited to the audited gateway execution path and defined host threat model; it does not guarantee that every runtime, kernel, or hardware memory copy is erased. `mlock` is engaged (subject to OS `RLIMIT_MEMLOCK` limits) to prevent ordinary page swapping. Security audits inspect swap, core dumps, application logs, and container writable layers.
+7. **Signed Audit Receipt:** The Gateway signs an audit receipt using its private Ed25519 signing key and returns it in the response header `X-Citadel-Audit-Receipt`. (Note: Ed25519 authenticates the Gateway's receipt and transaction digest; it does not independently prove the underlying physical hardware state).
 3. **Payload Decryption:** The HTTP request body contains:
    ```json
    {
@@ -91,9 +93,6 @@ The Ingress Gateway is engineered in Python AsyncIO to provide an OpenAI-compati
      "tag": "16-byte-authentication-tag"
    }
    ```
-4. **Zero-Disk In-Memory Decryption:** The Gateway decrypts the ciphertext in an ephemeral buffer backed strictly by `/dev/shm` (tmpfs). Buffers are managed via mutable `bytearray` or `ctypes.create_string_buffer` to allow direct in-place memory control.
-5. **Memory Zeroization & Swap Protection:** Immediately following request dispatch to the inference engine, the plaintext buffer is explicitly wiped in-place using `ctypes.memset(ctypes.addressof(buf), 0, len(buf))`. `mlock` is engaged on sensitive memory pools to prevent OS paging to swap disk.
-6. **Signed Audit Receipt:** The Gateway signs an audit receipt using its private Ed25519 signing key and returns it in the response header `X-Citadel-Audit-Receipt`. (Note: The receipt attests to the Gateway's internal zero-disk state and transaction hash; independent verification is established via OS-level audit scripts).
    ```json
    {
      "timestamp_epoch_ms": 1730438400123,
@@ -207,7 +206,7 @@ Every scaling action traverses an unyielding physical latency chain:
   ├── 3. HPA Reconcile Sync Period:                          15.0 s
   ├── 4. Kube-Scheduler Node Filter & Binding:                1.5 s
   ├── 5. Container Runtime Init & Image Overlay:              2.0 s
-  ├── 6. Model Weights Page-in (NVMe -> VRAM):                4.0 - 8.0 s
+  ├── 6. Model Weights Page-in (Storage to Host RAM to GPU VRAM via PCIe):                4.0 - 8.0 s
   └── 7. Engine Warmup & First KV Allocation:                 2.0 s
   │
   └── Total Physical Scaling Lag:                            30.5 - 38.5 s

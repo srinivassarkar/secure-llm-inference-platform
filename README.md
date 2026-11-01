@@ -1,6 +1,6 @@
 # Secure LLM Inference Platform
 
-A production-grade, confidential LLM inference platform engineered on Kubernetes. Combines an ephemeral zero-disk cryptographic ingress gateway (X25519 + AES-256-GCM) with vLLM continuous batching and KEDA leading-signal autoscaling to eliminate both data leakage and latency cliffs under burst traffic.
+A production-grade, confidential LLM inference platform engineered on Kubernetes. Combines an ephemeral zero-disk cryptographic ingress gateway (X25519 + AES-256-GCM) with vLLM continuous batching and KEDA leading-signal autoscaling to reduce plaintext exposure and mitigate latency cliffs under burst traffic.
 
 ```
 +-------------------------------------------------------------------------------------------------------+
@@ -64,37 +64,46 @@ flowchart TD
 ## 3. The Three Physical Planes
 
 ### Plane 1: Confidential Ingress Data Plane (Citadel Gateway)
-* **Authenticated Key Agreement & Replay Defense:** Clients verify the Gateway's ephemeral X25519 public key against an Ed25519-signed public identity certificate. Clients derive an ephemeral symmetric session key via ECDH + HKDF-SHA256 and encrypt payloads with AES-256-GCM. An in-memory sliding-window TTL cache rejects duplicate nonces and timestamps drifting beyond 60 seconds.
-* **Zero-Persistence Property & Audit Scope:** Decryption occurs strictly in volatile RAM (`/dev/shm` tmpfs). Memory buffers are allocated via mutable `bytearray` / `ctypes.create_string_buffer` and wiped in-place using `ctypes.memset`. `mlock` is engaged (subject to `RLIMIT_MEMLOCK`) to prevent page eviction to swap. Security audits inspect swap usage, core dumps, application logs, and container writable layers under a defined threat model.
+* **Authenticated Key Agreement & Certificate Validation:** Clients obtain and trust the Gateway's root Ed25519 identity key via out-of-band TLS/bootstrap. Ephemeral X25519 session public keys are validated against an Ed25519-signed manifest binding the gateway identity, timestamp, and a 1-hour expiration window: `Sign(Ed25519_priv, gateway_id || x25519_pub || expiry || nonce)`. Clients derive an ephemeral symmetric key via ECDH + HKDF-SHA256 and encrypt payloads with AES-256-GCM. An in-memory sliding-window TTL cache rejects duplicate nonces and requests with timestamps drifting beyond 60 seconds.
+* **Zero-Persistence Property & Audit Scope:** Decryption is performed using explicitly managed memory buffers backed by tmpfs (`/dev/shm`). The gateway minimizes plaintext persistence and performs in-place buffer wiping where supported (using mutable `bytearray` / `ctypes.create_string_buffer` and `ctypes.memset`). The zero-persistence claim is limited to the audited gateway execution path and defined host threat model; it does not guarantee that every runtime, kernel, or hardware memory copy is erased. `mlock` is engaged (subject to OS `RLIMIT_MEMLOCK` limits) to prevent ordinary page swapping. Security audits inspect swap, core dumps, application logs, and container writable layers.
 * **Request Lifecycle & Cancellation Propagation:** The Gateway manages an explicit lifecycle state machine:
   `ACCEPTED -> AUTHENTICATED -> ADMITTED -> STREAMING -> (COMPLETED | ABORTED | TIMED_OUT)`.
   When a client disconnects, the Gateway terminates the upstream streaming socket. vLLM's native `request.is_disconnected()` listener triggers its internal `engine.abort(request_id)` routine to release allocated PagedAttention KV blocks immediately.
 * **Overload Protection & Admission Control:** Employs bounded request queues (`asyncio.Queue(maxsize=128)`), maximum concurrency caps, request deadlines, and rapid 503 shedding (`Retry-After: 5`) to prevent gateway buffer bloat and protect backend GPUs from saturation collapse.
-* **Cryptographic Audit Receipts:** Returns an Ed25519-signed header (`X-Citadel-Audit-Receipt`) providing verifiable evidence of the Gateway's internal zero-persistence checks and transaction digest.
+* **Cryptographic Audit Receipts:** Returns an Ed25519-signed header (`X-Citadel-Audit-Receipt`) providing signed evidence of the Gateway's internal zero-persistence audit checks under a defined threat model. Ed25519 authenticates the receipt; it does not independently prove the underlying physical hardware state.
 * **Network Isolation Boundary:** Plaintext travels strictly across the private Kubernetes pod overlay network (isolated via Kubernetes NetworkPolicies). This provides Application-Layer Confidential Ingress; it does not substitute for hardware-enforced confidential computing (AMD SEV-SNP / Intel TDX).
 
 ### Plane 2: Accelerated Inference Fleet (vLLM on CUDA)
-* **High-Throughput Serving:** Deployed on enterprise NVIDIA silicon (L4 / RTX 4090 / A10G) using **PagedAttention** to eliminate external memory fragmentation.
+* **High-Throughput Serving:** Deployed on NVIDIA GPU hardware (L4, A10G or RTX 4090) using **PagedAttention** to reduce KV-cache memory fragmentation and allocation waste.
 * **Continuous Batching:** Schedules new prefill requests concurrently with active autoregressive decode iterations.
 * **Exposition:** Emits granular metrics on `:8000/metrics` including `vllm:num_requests_running`, `vllm:num_requests_waiting`, and `vllm:gpu_cache_usage_factor`.
 
 ### Plane 3: Autoscaling & SRE Control Plane (KEDA & Prometheus)
-* **Leading-Signal Autoscaling:** Evaluates real-time slot saturation:
+* **Capacity Saturation vs. Predictive Autoscaling:**
+  - *Baseline Capacity Saturation Ratio:* Evaluates active load plus pending queue:
 ```text
-                          sum(requests_running) + sum(requests_waiting)
-Saturation Ratio  =  -------------------------------------------------------
-                             Total Replicas  x  Slots Per Replica
+                               sum(requests_running) + sum(requests_waiting)
+Saturation Ratio (Baseline) = ------------------------------------------------
+                                     Total Replicas  x  Slots Per Replica
 ```
-* **The Scaling Lag Waterfall:** Derived sequential provisioning estimate under stated assumptions (Pre-warmed GPU Node Baseline):
+  - *Predictive Demand Trigger (Experimental Model):* Incorporates incoming request arrival rate (\(\lambda_{\mathrm{in}}\)) and estimated provisioning latency (\(T_{\mathrm{provision}}\)):
+```text
+                               sum(running) + sum(waiting) + (lambda_in x T_provision)
+Saturation Ratio (Predicted) = -------------------------------------------------------
+                                           Total Replicas  x  Slots Per Replica
+```
+  Both approaches will be benchmarked experimentally under burst traffic to determine whether predictive triggers prevent TTFT degradation before slots saturate.
+* **Estimated Provisioning Latency — Sequential Upper-Bound Model:**
+  Derived sequential delay breakdown under stated assumptions (Pre-warmed GPU Node Baseline):
   - 1. Metric Scrape Delay (Prometheus): 1.0 - 5.0 s
   - 2. KEDA Polling Interval (PromQL evaluation): 5.0 s
   - 3. HPA Reconcile Period: 15.0 s
-  - 4. Kube-Scheduler Node Binding: 1.5 s
+  - 4. Kube-Scheduler Node Filter & Binding: 1.5 s
   - 5. Containerd Init & Image Overlay: 2.0 s
-  - 6. Model Weights Page-in (NVMe to VRAM): 4.0 - 8.0 s
+  - 6. Model Weights Page-in (Storage to Host RAM to GPU VRAM via PCIe): 4.0 - 8.0 s
   - 7. Engine Warmup & KV Pre-allocation: 2.0 s
-  - **Total Sequential Lag Estimate:** 30.5 - 38.5 s *(Measured via pod lifecycle timestamps; actual runtime operations may partially overlap)*.
-  *(Note: If Cloud Cluster Autoscaler must provision a cold GPU node, add 90 - 180 s for cloud VM acquisition and NVIDIA driver initialization).*
+  - **Total Derived Sequential Upper-Bound:** 30.5 - 38.5 s *(Actual Kubernetes runtime operations may partially overlap; true elapsed duration is measured via pod lifecycle timestamps)*.
+  *(Note: If Cloud Cluster Autoscaler must provision a cold GPU node, add 90 - 180 s for cloud VM acquisition and NVIDIA driver initialization)*.
 * **Multi-Burn-Rate Alerting:** Implements Google SRE alerting standards across 5-minute (14.4x fast burn) and 1-hour (6x slow burn) error budget windows, alerting exclusively when client-perceived SLOs are threatened.
 
 ---
@@ -130,7 +139,7 @@ To provide an immediate, visually verifiable proof-of-work before executing clus
 | TIER 3: ACCELERATED INFERENCE ENGINE (vLLM Backend)                                                   |
 | - Containerized vLLM serving engine on CUDA (with CPU/OpenVINO fallback for local dev testing).       |
 | - Primary Model: Fast, compact model (`Qwen/Qwen2.5-Coder-0.5B-Instruct` or `SmolLM2-360M`).          |
-| - Targets: Rapid container iteration; sub-2.5s cold start target on NVMe; external weight mounts.      |
+| - Targets: Rapid container iteration (< 1 GB stripped runtime target; CUDA vLLM runtime is 4-8 GB with external weights); sub-2.5s cold start target on NVMe pending measurement.      |
 | - Exposes engine metrics on port 8000 (`/metrics`: `vllm:num_requests_running`, requests_waiting).     |
 +-------------------------------------------------------------------------------------------------------+
 ```
@@ -164,9 +173,9 @@ Every metric, latency figure, and throughput claim in this repository adheres to
 | :--- | :---: | :---: | :---: |
 | **Time to First Token (TTFT)** | $P_{95} \le 350\ \mathrm{ms}$ | Open-Loop k6 Ramping Load | **[Target Hypothesis]** *(Pending execution)* |
 | **Inter-Token Latency (TPOT)** | $P_{99} \le 35\ \mathrm{ms}$ ($> 28.5\ \text{tok/s}$) | Gateway Telemetry Exposition | **[Target Hypothesis]** *(Pending execution)* |
-| **Zero-Disk Persistence** | 0 Disk Bytes Written in `/dev/shm` | Linux I/O & `/dev/shm` Audit | **[Target Hypothesis]** *(Pending audit)* |
-| **Scaling Lag Duration** | $30.5\ \mathrm{s} - 38.5\ \mathrm{s}$ (Pre-warmed Node) | 7-Step Latency Interval Sum | **[D] Derived** *(To be measured via pod timestamps)* |
-| **KV Cache Memory Footprint** | $M_{\mathrm{KV}} = 2 \times L \times H_{\mathrm{kv}} \times D \times S \times B$ | First-Principles Attention Formula ($L$=layers, $H_{kv}$=heads, $D$=dim, $S$=tokens, $B$=bytes) | **[D] Derived** |
+| **Zero-Disk Persistence** | 0 Disk I/O to persistent storage (root fs / swap) | Linux I/O & Process Audit (`lsof`, `fuser`, swap accounting) | **[Target Hypothesis]** *(Pending audit)* |
+| **Scaling Lag Duration** | $30.5\ \mathrm{s} - 38.5\ \mathrm{s}$ (Pre-warmed Node) | Sequential Upper-Bound Model | **[D] Derived** *(To be measured via pod lifecycle timestamps)* |
+| **KV Cache Memory Footprint** | $M_{\mathrm{KV}} = 2 \times L \times H_{\mathrm{kv}} \times D \times S \times B$ | Theoretical Attention Formula ($L$=layers, $H_{kv}$=heads, $D$=dim, $S$=tokens, $B$=bytes) | **[D] Derived** *(Payload estimate; excludes block table overhead)* |
 | **PagedAttention Efficiency** | $< 4\%$ Internal Fragmentation | vLLM Architectural Specification | **[B] Borrowed** |
 
 ---
