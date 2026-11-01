@@ -37,7 +37,7 @@ flowchart TD
     CL["Load Generator / Client<br/>(k6 Open-Loop)"] -->|Encrypted X25519 + AES-256-GCM| GW["Citadel Ingress Gateway<br/>(Python AsyncIO)"]
     
     subgraph DataPlane ["Confidential Ingress Data Plane"]
-        GW -->|In-Memory Decrypt| SHM["Ephemeral Memory Boundary<br/>(/dev/shm tmpfs, Zero-Disk)"]
+        GW -->|In-Memory Decrypt| SHM["Ephemeral Memory Boundary<br/>(/dev/shm tmpfs, In-Place Wipe)"]
         GW -->|Sign Receipt| SIG["Ed25519 Audit Engine<br/>(SHA-256 Receipt)"]
         GW -->|Client Disconnect| CN["Cancellation Propagator<br/>(Abort GPU Loop)"]
     end
@@ -76,10 +76,15 @@ flowchart TD
 ### Plane 2: Accelerated Inference Fleet (vLLM on CUDA)
 * **High-Throughput Serving:** Deployed on NVIDIA GPU hardware (L4, A10G or RTX 4090) using **PagedAttention** to reduce KV-cache memory fragmentation and allocation waste.
 * **Continuous Batching:** Schedules new prefill requests concurrently with active autoregressive decode iterations.
-* **Exposition:** Emits granular metrics on `:8000/metrics` including `vllm:num_requests_running`, `vllm:num_requests_waiting`, and `vllm:gpu_cache_usage_factor`.
+* **Exposition:** Emits granular metrics on `:8000/metrics` including `vllm:num_requests_running`, `vllm:num_requests_waiting`, and `vllm:gpu_cache_usage_perc`.
 
 ### Plane 3: Autoscaling & SRE Control Plane (KEDA & Prometheus)
-* **Capacity Saturation vs. Predictive Autoscaling:**
+* **Three Isolated Experimental Scaling Arms:**
+  To guarantee uncompromised attribution, scaling policies are deployed as separate, isolated `ScaledObject` manifests (`deploy/keda/`) and evaluated under identical open-loop arrival rates:
+  - *Arm 1 (Reactive Baseline):* Scales strictly on deferred queue depth (`vllm:num_requests_waiting > 1`).
+  - *Arm 2 (Capacity Saturation Ratio):* Evaluates active plus pending requests divided by verified ready replica capacity.
+  - *Arm 3 (Predictive Demand Model - Experimental):* Evaluates incoming request velocity (\(\lambda_{\mathrm{in}}\)) and provisioning delay (\(T_p\)).
+* **Capacity Saturation vs. Predictive Autoscaling Formulations:**
   - *Baseline Capacity Saturation Ratio:* Evaluates active load plus pending queue:
 ```text
                                sum(requests_running) + sum(requests_waiting)
@@ -185,7 +190,7 @@ Every metric, latency figure, and throughput claim in this repository adheres to
 ```
 secure-llm-inference-platform/
 ├── deploy/                                   # Declarative Kubernetes Manifests & Helm Charts
-│   ├── keda/                                 # KEDA ScaledObject with PromQL triggers
+│   ├── keda/                                 # 3 Isolated KEDA Arms (arm1-queue, arm2-saturation, arm3-predictive)
 │   ├── monitoring/                           # Prometheus Operator, Grafana dashboards, alerting rules
 │   ├── gateway/                              # Citadel Gateway Deployment, Service, and ConfigMaps
 │   └── vllm/                                 # vLLM GPU Deployment, ServiceMonitor, and PVCs
