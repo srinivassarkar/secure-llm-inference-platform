@@ -103,11 +103,11 @@ The Ingress Gateway is engineered in Python AsyncIO to provide an OpenAI-compati
 
 3. **Key Agreement & Derivation:**
    - The client generates an ephemeral Curve25519 keypair (`sk_client`, `pk_client`).
-   - Shared secret is computed via ECDH: $Z = \text{X25519}(sk_{\mathrm{client}}, pk_{\mathrm{gw}})$.
+   - Shared secret is computed via ECDH: `Z = X25519(sk_client, pk_gateway)`
    - Symmetric keys are derived using HKDF-SHA256 binding the handshake transcript into `info`:
-     - $\text{PRK} = \text{HKDF-Extract}(\text{salt}, Z)$
-     - $K_{\mathrm{in}} = \text{HKDF-Expand}(\text{PRK}, \text{"citadel-inbound-v1"} \parallel \text{key\_id}, 32)$
-     - $K_{\mathrm{out}} = \text{HKDF-Expand}(\text{PRK}, \text{"citadel-outbound-v1"} \parallel \text{key\_id}, 32)$
+     - `PRK = HKDF-Extract(salt, Z)`
+     - `K_in = HKDF-Expand(PRK, "citadel-inbound-v1" || key_id, 32)`
+     - `K_out = HKDF-Expand(PRK, "citadel-outbound-v1" || key_id, 32)`
 
 4. **Bidirectional Confidentiality (Inbound Request + Outbound Stream):**
    - **Inbound Request:** The client encrypts the JSON prompt payload using AES-256-GCM with key $K_{\mathrm{in}}$, binding `pk_client`, `timestamp`, and `key_id` into the Associated Authenticated Data (AAD):
@@ -194,18 +194,20 @@ Plaintext prompts travel strictly across the private Kubernetes pod overlay netw
 
 #### A. KV Cache Memory Mathematical Specification
 The theoretical payload memory consumption for an autoregressive sequence is defined by first principles:
-\[
-M_{\mathrm{KV}} = 2 \times L \times H_{\mathrm{kv}} \times D \times S \times B
-\]
-Where:
-- \(L\): Number of transformer layers.
-- \(H_{\mathrm{kv}}\): Number of Key-Value heads (accounting for Grouped-Query Attention).
-- \(D\): Head dimension (\(d_{\mathrm{model}} / H_q\)).
-- \(S\): Number of cached sequence tokens.
-- \(B\): Bytes per element (2 bytes for FP16/BF16, 1 byte for FP8).
-- Factor \(2\): Separate Key and Value tensors.
 
-For \(N\) concurrent active sequences, total theoretical VRAM payload is \(M_{\mathrm{total}} = \sum_{i=1}^{N} M_{\mathrm{KV}}^{(i)}\). Actual engine memory allocation includes PagedAttention block table indexing overhead and block-size rounding (typically 16 or 32 tokens per block).
+$$
+M_{\mathrm{KV}} = 2 \times L \times H_{\mathrm{kv}} \times D \times S \times B
+$$
+
+Where:
+- $L$: Number of transformer layers.
+- $H_{\mathrm{kv}}$: Number of Key-Value heads (accounting for Grouped-Query Attention).
+- $D$: Head dimension ($d_{\mathrm{model}} / H_q$).
+- $S$: Number of cached sequence tokens.
+- $B$: Bytes per element (2 bytes for FP16/BF16, 1 byte for FP8).
+- Factor $2$: Separate Key and Value tensors.
+
+For $N$ concurrent active sequences, total theoretical VRAM payload is $M_{\mathrm{total}} = \sum_{i=1}^{N} M_{\mathrm{KV}}^{(i)}$. Actual engine memory allocation includes PagedAttention block table indexing overhead and block-size rounding (typically 16 or 32 tokens per block).
 
 #### B. Architecture & Serving Engine
 The inference fleet is powered by **vLLM** hosted on NVIDIA GPU hardware (L4, A10G or RTX 4090):
@@ -252,13 +254,20 @@ spec:
 ```
 
 * **Slot Capacity Definition:**
-  Slots Per Replica (\(S_{\mathrm{replica}}\)) is determined by the engine's pre-allocated KV-cache memory divided by the maximum context sequence length (\(M_{\mathrm{KV\_alloc}} / S_{\mathrm{max}}\)), or calibrated by peak concurrent throughput before decode latency degrades beyond target SLOs. For homogeneous GPU clusters (e.g., uniform NVIDIA L4 24GB instances), capacity is uniform: \(\text{Total Slots} = N_{\mathrm{ready}} \times S_{\mathrm{replica}}\). In heterogeneous deployments, total capacity is evaluated as the sum of individual ready replica allocations: \(\sum_{i=1}^{N_{\mathrm{ready}}} S_i\).
+  Slots Per Replica ($S_{\mathrm{replica}}$) is determined by the engine's pre-allocated KV-cache memory divided by the maximum context sequence length ($M_{\mathrm{KV}} / S_{\mathrm{max}}$), or calibrated by peak concurrent throughput before decode latency degrades beyond target SLOs. For homogeneous GPU clusters (e.g., uniform NVIDIA L4 24GB instances), capacity is uniform: $\text{Total Slots} = N_{\mathrm{ready}} \times S_{\mathrm{replica}}$. In heterogeneous deployments, total capacity is evaluated as the sum of individual ready replica allocations: $\sum_{i=1}^{N_{\mathrm{ready}}} S_i$.
 
 ##### Arm 2: Capacity Saturation Ratio (`deploy/keda/arm2-capacity-saturation.yaml`)
 Evaluates active load plus pending queue divided by total ready capacity:
-\[
-S_{\mathrm{capacity}} = \frac{\sum \text{requests\_running} + \sum \text{requests\_waiting}}{\text{Ready Replicas} \times \text{Slots Per Replica}}
-\]
+
+$$
+S_{\mathrm{capacity}} = \frac{\sum R_{\mathrm{running}} + \sum W_{\mathrm{waiting}}}{N_{\mathrm{ready}} \times S_{\mathrm{replica}}}
+$$
+
+```text
+                               sum(requests_running) + sum(requests_waiting)
+Saturation Ratio (Baseline) = ------------------------------------------------
+                                     Ready Replicas  x  Slots Per Replica
+```
 ```yaml
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -284,11 +293,19 @@ spec:
 ```
 
 ##### Arm 3: Predictive Demand Model (`deploy/keda/arm3-predictive-demand.yaml`)
-Hypothesis model incorporating incoming request arrival rate (\(\lambda_{\mathrm{in}}\)) and estimated provisioning latency (\(T_p\)):
-\[
-S_{\mathrm{predicted}} = \frac{R + W + (\lambda_{\mathrm{in}} \times T_p)}{C}
-\]
-* **Implementation Note:** The predictive saturation signal will initially be computed as a Prometheus recording rule or gateway-exported metric (`rate(gateway_requests_total[30s])` combined with estimated provisioning latency \(T_p\)). KEDA consumes that metric through its Prometheus scaler. The baseline and predictive policies run as separate experimental configurations (`deploy/keda/arm2-capacity-saturation.yaml` and `deploy/keda/arm3-predictive-demand.yaml`), not simultaneous triggers in one `ScaledObject`.
+Hypothesis model incorporating incoming request arrival rate ($\lambda_{\mathrm{in}}$) and estimated provisioning latency ($T_p$):
+
+$$
+S_{\mathrm{predicted}} = \frac{R_{\mathrm{running}} + W_{\mathrm{waiting}} + (\lambda_{\mathrm{in}} \times T_p)}{C_{\mathrm{total}}}
+$$
+
+```text
+                               sum(running) + sum(waiting) + (lambda_in x T_provision)
+Saturation Ratio (Predicted) = -------------------------------------------------------
+                                            Ready Replicas  x  Slots Per Replica
+```
+
+* **Implementation Note:** The predictive saturation signal will initially be computed as a Prometheus recording rule or gateway-exported metric (`rate(gateway_requests_total[30s])` combined with estimated provisioning latency $T_p$). KEDA consumes that metric through its Prometheus scaler. The baseline and predictive policies run as separate experimental configurations (`deploy/keda/arm2-capacity-saturation.yaml` and `deploy/keda/arm3-predictive-demand.yaml`), not simultaneous triggers in one `ScaledObject`.
 ```yaml
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject

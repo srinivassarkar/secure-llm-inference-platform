@@ -82,9 +82,9 @@ flowchart TD
   To guarantee uncompromised attribution, scaling policies are deployed as separate, isolated `ScaledObject` manifests (`deploy/keda/`) and evaluated under identical open-loop arrival rates:
   - *Arm 1 (Reactive Baseline):* Scales strictly on waiting queue depth (`vllm:num_requests_waiting > 1`).
   - *Arm 2 (Capacity Saturation Ratio):* Evaluates active plus pending requests divided by verified ready replica capacity.
-  - *Arm 3 (Predictive Demand Model - Experimental):* Evaluates incoming request velocity (\(\lambda_{\mathrm{in}}\)) and provisioning delay (\(T_p\)).
+  - *Arm 3 (Predictive Demand Model - Experimental):* Evaluates incoming request velocity ($\lambda_{\mathrm{in}}$) and provisioning delay ($T_p$).
 * **Slot Capacity Definition:**
-  Slots Per Replica (\(S_{\mathrm{replica}}\)) is determined by the engine's pre-allocated KV-cache memory divided by the maximum context sequence length (\(M_{\mathrm{KV\_alloc}} / S_{\mathrm{max}}\)), or calibrated by peak concurrent throughput before decode latency degrades beyond target SLOs. For homogeneous GPU clusters (e.g., uniform NVIDIA L4 24GB instances), capacity is uniform: \(\text{Total Slots} = N_{\mathrm{ready}} \times S_{\mathrm{replica}}\). In heterogeneous deployments, total capacity is evaluated as the sum of individual ready replica allocations: \(\sum_{i=1}^{N_{\mathrm{ready}}} S_i\).
+  Slots Per Replica ($S_{\mathrm{replica}}$) is determined by the engine's pre-allocated KV-cache memory divided by the maximum context sequence length ($M_{\mathrm{KV}} / S_{\mathrm{max}}$), or calibrated by peak concurrent throughput before decode latency degrades beyond target SLOs. For homogeneous GPU clusters (e.g., uniform NVIDIA L4 24GB instances), capacity is uniform: $\text{Total Slots} = N_{\mathrm{ready}} \times S_{\mathrm{replica}}$. In heterogeneous deployments, total capacity is evaluated as the sum of individual ready replica allocations: $\sum_{i=1}^{N_{\mathrm{ready}}} S_i$.
 * **Capacity Saturation vs. Predictive Autoscaling Formulations:**
   - *Baseline Capacity Saturation Ratio:* Evaluates active load plus pending queue:
 ```text
@@ -92,14 +92,14 @@ flowchart TD
 Saturation Ratio (Baseline) = ------------------------------------------------
                                      Total Replicas  x  Slots Per Replica
 ```
-  - *Predictive Demand Trigger (Experimental Model):* Incorporates incoming request arrival rate (\(\lambda_{\mathrm{in}}\)) and estimated provisioning latency (\(T_{\mathrm{provision}}\)):
+  - *Predictive Demand Trigger (Experimental Model):* Incorporates incoming request arrival rate ($\lambda_{\mathrm{in}}$) and estimated provisioning latency ($T_{\mathrm{provision}}$):
 ```text
                                sum(running) + sum(waiting) + (lambda_in x T_provision)
 Saturation Ratio (Predicted) = -------------------------------------------------------
                                             Total Replicas  x  Slots Per Replica
 ```
 * **Implementation Note on Predictive Signal Generation:**
-  The predictive saturation signal will initially be computed as a Prometheus recording rule or gateway-exported metric (`rate(http_requests_total[30s])` combined with estimated provisioning latency \(T_{\mathrm{provision}}\)). KEDA consumes that metric through its standard Prometheus scaler.
+  The predictive saturation signal will initially be computed as a Prometheus recording rule or gateway-exported metric (`rate(http_requests_total[30s])` combined with estimated provisioning latency $T_{\mathrm{provision}}$). KEDA consumes that metric through its standard Prometheus scaler.
   The baseline and predictive policies will run as separate experimental configurations (`deploy/keda/arm2-capacity-saturation.yaml` and `deploy/keda/arm3-predictive-demand.yaml`), not simultaneous triggers in one `ScaledObject`, ensuring independent experimental attribution.
 * **Estimated Provisioning Latency — Sequential Upper-Bound Model:**
   Derived sequential delay breakdown under stated assumptions (Pre-warmed GPU Node Baseline):
