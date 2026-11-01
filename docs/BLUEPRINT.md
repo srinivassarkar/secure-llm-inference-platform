@@ -103,11 +103,11 @@ The Ingress Gateway is engineered in Python AsyncIO to provide an OpenAI-compati
 
 3. **Key Agreement & Derivation:**
    - The client generates an ephemeral Curve25519 keypair (`sk_client`, `pk_client`).
-   - Shared secret is computed via ECDH: $Z = 	ext{X25519}(sk_{\mathrm{client}}, pk_{\mathrm{gw}})$.
+   - Shared secret is computed via ECDH: $Z = \text{X25519}(sk_{\mathrm{client}}, pk_{\mathrm{gw}})$.
    - Symmetric keys are derived using HKDF-SHA256 binding the handshake transcript into `info`:
-     - $	ext{PRK} = 	ext{HKDF-Extract}(	ext{salt}, Z)$
-     - $K_{\mathrm{in}} = 	ext{HKDF-Expand}(	ext{PRK}, 	ext{"citadel-inbound-v1"} \parallel 	ext{key\_id}, 32)$
-     - $K_{\mathrm{out}} = 	ext{HKDF-Expand}(	ext{PRK}, 	ext{"citadel-outbound-v1"} \parallel 	ext{key\_id}, 32)$
+     - $\text{PRK} = \text{HKDF-Extract}(\text{salt}, Z)$
+     - $K_{\mathrm{in}} = \text{HKDF-Expand}(\text{PRK}, \text{"citadel-inbound-v1"} \parallel \text{key\_id}, 32)$
+     - $K_{\mathrm{out}} = \text{HKDF-Expand}(\text{PRK}, \text{"citadel-outbound-v1"} \parallel \text{key\_id}, 32)$
 
 4. **Bidirectional Confidentiality (Inbound Request + Outbound Stream):**
    - **Inbound Request:** The client encrypts the JSON prompt payload using AES-256-GCM with key $K_{\mathrm{in}}$, binding `pk_client`, `timestamp`, and `key_id` into the Associated Authenticated Data (AAD):
@@ -169,7 +169,8 @@ REQUEST_ACCEPTED ──► AUTHENTICATE_DECRYPT ──► ADMISSION_CHECK
 [Signed Audit Receipt]                    [vLLM GPU Loops Freed]
 ```
 
-- **Cancellation Mechanism:** The Gateway monitors client socket transport state (`connection_lost` or ASGI disconnect). Upon disconnect, it immediately terminates the upstream HTTP streaming socket to vLLM. vLLM's native disconnect listener (`request.is_disconnected()`) detects the socket drop and triggers its internal `engine.abort(request_id)` handler.
+- **Cancellation Mechanism:** The Gateway detects client disconnection (`connection_lost` or ASGI disconnect), terminates the upstream streaming request to vLLM, and verifies whether the deployed vLLM version aborts the corresponding generation and releases its KV-cache allocations. Cancellation propagation and resource-release latency are measured experimentally.
+- **Mid-Stream Timeout Semantics:** If an SLA or client timeout occurs before token generation initiates, the gateway returns HTTP 408/504; if the SSE chunk stream has already begun emitting tokens, the gateway terminates the chunk stream immediately rather than attempting an invalid mid-stream HTTP status header.
 - **Empirical Hypothesis:** We hypothesize that socket-drop cancellation reduces wasted GPU decode tokens under client churn. This benefit will be measured explicitly in Phase 3 benchmarks comparing wasted tokens with and without propagation.
 
 #### C. Overload Protection & Gateway Admission Control
@@ -184,12 +185,17 @@ To prevent the Ingress Gateway itself from becoming a queue-bloated failure doma
 
 ---
 
+#### D. Network Isolation & Response Confidentiality Boundary
+Plaintext prompts travel strictly across the private Kubernetes pod overlay network, isolated via Kubernetes `NetworkPolicies` that drop all non-gateway ingress to vLLM.
+- **Confidentiality Scope:** The current protocol protects client-to-gateway request payloads. Gateway-to-client response confidentiality is provided by the configured transport security unless a separate application-layer response-encryption mechanism is implemented.
+- **Hardware Boundary:** This Application-Layer Confidential Ingress architecture guarantees zero-persistence and authenticated ingress under the audited software stack; it does not substitute for hardware-enforced confidential computing enclaves (such as AMD SEV-SNP or Intel TDX).
+
 ### 3.2 Plane 2: Accelerated Inference Plane (vLLM Engine)
 
 #### A. KV Cache Memory Mathematical Specification
 The theoretical payload memory consumption for an autoregressive sequence is defined by first principles:
 \[
-M_{\mathrm{KV}} = 2 	imes L 	imes H_{\mathrm{kv}} 	imes D 	imes S 	imes B
+M_{\mathrm{KV}} = 2 \times L \times H_{\mathrm{kv}} \times D \times S \times B
 \]
 Where:
 - \(L\): Number of transformer layers.
@@ -207,7 +213,7 @@ The inference fleet is powered by **vLLM** hosted on NVIDIA GPU hardware (L4, A1
 - **Continuous Batching:** Dynamic iteration-level scheduling combining arriving prefill requests with active decode iterations.
 - **Engine Metrics Exposition:** Metrics verified against pinned vLLM release (v0.6+):
   - `vllm:num_requests_running`: Currently active requests occupying GPU slots.
-  - `vllm:num_requests_waiting`: Requests deferred in the internal scheduler queue.
+  - `vllm:num_requests_waiting`: Requests waiting in the internal scheduler queue.
   - `vllm:gpu_cache_usage_perc`: Ratio of allocated KV cache blocks (percentage 0.0 - 1.0).
 
 ---
@@ -217,7 +223,7 @@ The inference fleet is powered by **vLLM** hosted on NVIDIA GPU hardware (L4, A1
 #### A. The Autoscaling Dilemma: Memory & Queue Limitations
 1. **GPU Memory is Invariant:** vLLM pre-allocates 90% of VRAM on boot for PagedAttention KV blocks. Memory utilization is always 90%+, rendering GPU memory HPA a poor replica-scaling signal.
 2. **CPU Utilization is Uncorrelated:** The CPU orchestrates batching iterations; it can saturate while the GPU is under-utilized or stay idle while the GPU memory bus is pegged.
-3. **Queue Depth is Reactive:** Scaling when `num_requests_waiting > 0` triggers scaling only *after* requests are already deferred in queue. Given pod startup latency, TTFT immediately collapses.
+3. **Queue Depth is Reactive:** Scaling when `num_requests_waiting > 0` triggers scaling only *after* requests are already waiting in queue. Given pod startup latency, TTFT immediately collapses.
 
 #### B. Three Independent Experimental Arms (Isolated KEDA Configurations)
 To ensure rigorous experimental attribution, the three scaling strategies are evaluated in **separate, isolated `ScaledObject` deployments** against identical workloads:
@@ -245,10 +251,13 @@ spec:
         threshold: "1"
 ```
 
+* **Slot Capacity Definition:**
+  Slots Per Replica (\(S_{\mathrm{replica}}\)) is determined by the engine's pre-allocated KV-cache memory divided by the maximum context sequence length (\(M_{\mathrm{KV\_alloc}} / S_{\mathrm{max}}\)), or calibrated by peak concurrent throughput before decode latency degrades beyond target SLOs. For homogeneous GPU clusters (e.g., uniform NVIDIA L4 24GB instances), capacity is uniform: \(\text{Total Slots} = N_{\mathrm{ready}} \times S_{\mathrm{replica}}\). In heterogeneous deployments, total capacity is evaluated as the sum of individual ready replica allocations: \(\sum_{i=1}^{N_{\mathrm{ready}}} S_i\).
+
 ##### Arm 2: Capacity Saturation Ratio (`deploy/keda/arm2-capacity-saturation.yaml`)
 Evaluates active load plus pending queue divided by total ready capacity:
 \[
-S_{\mathrm{capacity}} = rac{\sum 	ext{requests\_running} + \sum 	ext{requests\_waiting}}{	ext{Ready Replicas} 	imes 	ext{Slots Per Replica}}
+S_{\mathrm{capacity}} = \frac{\sum \text{requests\_running} + \sum \text{requests\_waiting}}{\text{Ready Replicas} \times \text{Slots Per Replica}}
 \]
 ```yaml
 apiVersion: keda.sh/v1alpha1
@@ -277,8 +286,9 @@ spec:
 ##### Arm 3: Predictive Demand Model (`deploy/keda/arm3-predictive-demand.yaml`)
 Hypothesis model incorporating incoming request arrival rate (\(\lambda_{\mathrm{in}}\)) and estimated provisioning latency (\(T_p\)):
 \[
-S_{\mathrm{predicted}} = rac{R + W + (\lambda_{\mathrm{in}} 	imes T_p)}{C}
+S_{\mathrm{predicted}} = \frac{R + W + (\lambda_{\mathrm{in}} \times T_p)}{C}
 \]
+* **Implementation Note:** The predictive saturation signal will initially be computed as a Prometheus recording rule or gateway-exported metric (`rate(gateway_requests_total[30s])` combined with estimated provisioning latency \(T_p\)). KEDA consumes that metric through its Prometheus scaler. The baseline and predictive policies run as separate experimental configurations (`deploy/keda/arm2-capacity-saturation.yaml` and `deploy/keda/arm3-predictive-demand.yaml`), not simultaneous triggers in one `ScaledObject`.
 ```yaml
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -330,11 +340,11 @@ Following Google SRE multi-burn-rate best practices, alerts calculate true error
 
 ### 4.1 Service Level Objectives (SLOs) & Security Release Gates
 - **TTFT SLO:** 95% of requests must receive their first streaming token in $\le 350\ \mathrm{ms}$ ($P_{95}$).
-- **TPOT SLO:** 99% of generated tokens must exhibit an inter-token latency of $\le 35\ \mathrm{ms}$ ($> 28.5\ 	ext{tok/s}$).
+- **TPOT SLO:** 99% of generated tokens must exhibit an inter-token latency of $\le 35\ \mathrm{ms}$ ($> 28.5\ \text{tok/s}$).
 - **Security Release Gate (Binary):** All cryptographic verification tests, zero-persistence audit scripts, and replay rejections must pass 100% in CI before deployment (treated as a deployment-blocking gate, not an elastic SLO).
 
 ### 4.2 True 14.4x Multi-Burn-Rate Alerting Rules (`prometheus_rules.yml`)
-For a 95% SLO, the error budget fraction is $1 - 0.95 = 0.05$. A 14.4x burn rate means the error ratio exceeds $14.4 	imes 0.05 = 0.72$ (72% of requests breaching SLO):
+For a 95% SLO, the error budget fraction is $1 - 0.95 = 0.05$. A 14.4x burn rate means the error ratio exceeds $14.4 \times 0.05 = 0.72$ (72% of requests breaching SLO):
 
 ```yaml
 groups:

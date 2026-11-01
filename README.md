@@ -21,13 +21,12 @@ A production-grade, confidential LLM inference platform engineered on Kubernetes
 Enterprise deployments of Large Language Models in regulated industries (FinTech, healthcare, and defense) face two fundamental systems barriers:
 
 1. **The Confidentiality Gap:** Standard LLM serving architectures route plaintext prompts through ingress proxies, sidecars, and cluster storage. A single compromised volume, misconfigured logging pipeline, or host node compromise exposes sensitive customer PII or proprietary IP.
-2. **The Autoscaling Lag Paradox:** Standard Kubernetes Horizontal Pod Autoscalers (HPA) rely on CPU or Memory utilization. In LLM serving, GPU memory is pre-allocated by engines (vLLM) for KV cache management, remaining invariant at 90%+, while CPU usage is decoupled from GPU saturation. Conversely, reactive queue-based scaling triggers only *after* requests are deferred, causing Time-to-First-Token (TTFT) latency to explode by $10\times$ during the 30-50 second pod startup window.
+2. **The Autoscaling Lag Paradox:** Standard Kubernetes Horizontal Pod Autoscalers (HPA) rely on CPU or Memory utilization. In LLM serving, GPU memory is pre-allocated by engines (vLLM) for KV cache management, remaining invariant near the configured allocation ceiling (e.g. 90%+) regardless of instantaneous request concurrency [B]. CPU utilization is largely decoupled from GPU saturation [B]. Conversely, reactive queue-based scaling triggers only after requests begin waiting in queue; this can cause substantial TTFT degradation when demand exceeds available capacity during replica provisioning [Target Hypothesis]. The exact degradation magnitude will be measured under controlled burst workloads. Sequential pod provisioning delay is estimated at 30.5–38.5 seconds on pre-warmed GPU nodes [D], while scaling cold cloud GPU nodes adds 90–180 seconds for cloud VM acquisition and driver initialization [B].
 
 The **Secure LLM Inference Platform** resolves both constraints by decoupling the secure ingress boundary from the accelerated compute fleet:
 
-* **Confidential Zero-Disk Ingress Gateway:** Decrypts application-layer encrypted payloads (X25519 key exchange + AES-256-GCM) exclusively within volatile memory (`/dev/shm`), passes tokens with immediate cancellation propagation on client disconnect, and emits Ed25519-signed verification receipts providing signed evidence of the gateway's zero-persistence audit checks under a defined threat model.
-* **Proactive KEDA Autoscaling:** Replaces lagging metrics with a leading-signal slot saturation ratio `(running + deferred) / total_slots`, triggering pod provisioning before the concurrency cliff is reached.
-
+* **Confidential Ingress Gateway:** Decrypts application-layer encrypted payloads (X25519 key exchange + AES-256-GCM) within explicitly managed, volatile-memory-backed buffers, with audited zero-persistence controls under a defined host threat model. The gateway detects client disconnections, terminates upstream streaming sockets, and emits Ed25519-signed verification receipts providing signed evidence of the gateway's zero-persistence audit checks.
+* **Proactive KEDA Autoscaling:** Evaluates leading-signal slot saturation `(running + waiting) / total_slots`, triggering pod provisioning before the concurrency cliff is reached.
 ---
 
 ## 2. System Architecture
@@ -37,7 +36,7 @@ flowchart TD
     CL["Load Generator / Client<br/>(k6 Open-Loop)"] -->|Encrypted X25519 + AES-256-GCM| GW["Citadel Ingress Gateway<br/>(Python AsyncIO)"]
     
     subgraph DataPlane ["Confidential Ingress Data Plane"]
-        GW -->|In-Memory Decrypt| SHM["Ephemeral Memory Boundary<br/>(/dev/shm tmpfs, In-Place Wipe)"]
+        GW -->|In-Memory Decrypt| SHM["Ephemeral Memory Boundary<br/>(/dev/shm tmpfs, audited zero-persistence boundary)"]
         GW -->|Sign Receipt| SIG["Ed25519 Audit Engine<br/>(SHA-256 Receipt)"]
         GW -->|Client Disconnect| CN["Cancellation Propagator<br/>(Abort GPU Loop)"]
     end
@@ -68,22 +67,24 @@ flowchart TD
 * **Zero-Persistence Property & Audit Scope:** Decryption is performed using explicitly managed memory buffers backed by tmpfs (`/dev/shm`). The gateway minimizes plaintext persistence and performs in-place buffer wiping where supported (using mutable `bytearray` / `ctypes.create_string_buffer` and `ctypes.memset`). The zero-persistence claim is limited to the audited gateway execution path and defined host threat model; it does not guarantee that every runtime, kernel, or hardware memory copy is erased. `mlock` is engaged (subject to OS `RLIMIT_MEMLOCK` limits) to prevent ordinary page swapping. Security audits inspect swap, core dumps, application logs, and container writable layers.
 * **Request Lifecycle & Cancellation Propagation:** The Gateway manages an explicit lifecycle state machine:
   `ACCEPTED -> AUTHENTICATED -> ADMITTED -> STREAMING -> (COMPLETED | ABORTED | TIMED_OUT)`.
-  When a client disconnects, the Gateway terminates the upstream streaming socket. vLLM's native `request.is_disconnected()` listener triggers its internal `engine.abort(request_id)` routine to release allocated PagedAttention KV blocks immediately.
+  The Gateway detects client disconnection, terminates the upstream streaming request and verifies whether the deployed vLLM version aborts the corresponding generation and releases its KV-cache allocations. Cancellation propagation and resource-release latency are measured experimentally. If a timeout occurs before token generation begins, the gateway returns HTTP 408/504; if the SSE response stream has already initiated, the gateway immediately terminates the chunk stream rather than attempting an invalid mid-stream HTTP status header.
 * **Overload Protection & Admission Control:** Employs bounded request queues (`asyncio.Queue(maxsize=128)`), maximum concurrency caps, request deadlines, and rapid 503 shedding (`Retry-After: 5`) to prevent gateway buffer bloat and protect backend GPUs from saturation collapse.
 * **Cryptographic Audit Receipts:** Returns an Ed25519-signed header (`X-Citadel-Audit-Receipt`) providing signed evidence of the Gateway's internal zero-persistence audit checks under a defined threat model. Ed25519 authenticates the receipt; it does not independently prove the underlying physical hardware state.
-* **Network Isolation Boundary:** Plaintext travels strictly across the private Kubernetes pod overlay network (isolated via Kubernetes NetworkPolicies). This provides Application-Layer Confidential Ingress; it does not substitute for hardware-enforced confidential computing (AMD SEV-SNP / Intel TDX).
+* **Network Isolation & Response Confidentiality Boundary:** Plaintext travels strictly across the private Kubernetes pod overlay network (isolated via Kubernetes NetworkPolicies). This provides Application-Layer Confidential Ingress; it does not substitute for hardware-enforced confidential computing (AMD SEV-SNP / Intel TDX). The current protocol protects client-to-gateway request payloads. Gateway-to-client response confidentiality is provided by the configured transport security unless a separate application-layer response-encryption mechanism is implemented.
 
 ### Plane 2: Accelerated Inference Fleet (vLLM on CUDA)
-* **High-Throughput Serving:** Deployed on NVIDIA GPU hardware (L4, A10G or RTX 4090) using **PagedAttention** to reduce KV-cache memory fragmentation and allocation waste.
+* **High-Throughput Serving:** Deployed on NVIDIA GPU hardware (L4, A10G or RTX 4090) using **PagedAttention** to reduce KV-cache memory fragmentation (< 4% internal fragmentation in canonical benchmarks, Kwon et al., SOSP 2023 [B]; empirical fragmentation under mixed sequence distributions is measured experimentally).
 * **Continuous Batching:** Schedules new prefill requests concurrently with active autoregressive decode iterations.
 * **Exposition:** Emits granular metrics on `:8000/metrics` including `vllm:num_requests_running`, `vllm:num_requests_waiting`, and `vllm:gpu_cache_usage_perc`.
 
 ### Plane 3: Autoscaling & SRE Control Plane (KEDA & Prometheus)
 * **Three Isolated Experimental Scaling Arms:**
   To guarantee uncompromised attribution, scaling policies are deployed as separate, isolated `ScaledObject` manifests (`deploy/keda/`) and evaluated under identical open-loop arrival rates:
-  - *Arm 1 (Reactive Baseline):* Scales strictly on deferred queue depth (`vllm:num_requests_waiting > 1`).
+  - *Arm 1 (Reactive Baseline):* Scales strictly on waiting queue depth (`vllm:num_requests_waiting > 1`).
   - *Arm 2 (Capacity Saturation Ratio):* Evaluates active plus pending requests divided by verified ready replica capacity.
   - *Arm 3 (Predictive Demand Model - Experimental):* Evaluates incoming request velocity (\(\lambda_{\mathrm{in}}\)) and provisioning delay (\(T_p\)).
+* **Slot Capacity Definition:**
+  Slots Per Replica (\(S_{\mathrm{replica}}\)) is determined by the engine's pre-allocated KV-cache memory divided by the maximum context sequence length (\(M_{\mathrm{KV\_alloc}} / S_{\mathrm{max}}\)), or calibrated by peak concurrent throughput before decode latency degrades beyond target SLOs. For homogeneous GPU clusters (e.g., uniform NVIDIA L4 24GB instances), capacity is uniform: \(\text{Total Slots} = N_{\mathrm{ready}} \times S_{\mathrm{replica}}\). In heterogeneous deployments, total capacity is evaluated as the sum of individual ready replica allocations: \(\sum_{i=1}^{N_{\mathrm{ready}}} S_i\).
 * **Capacity Saturation vs. Predictive Autoscaling Formulations:**
   - *Baseline Capacity Saturation Ratio:* Evaluates active load plus pending queue:
 ```text
@@ -95,9 +96,11 @@ Saturation Ratio (Baseline) = ------------------------------------------------
 ```text
                                sum(running) + sum(waiting) + (lambda_in x T_provision)
 Saturation Ratio (Predicted) = -------------------------------------------------------
-                                           Total Replicas  x  Slots Per Replica
+                                            Total Replicas  x  Slots Per Replica
 ```
-  Both approaches will be benchmarked experimentally under burst traffic to determine whether predictive triggers prevent TTFT degradation before slots saturate.
+* **Implementation Note on Predictive Signal Generation:**
+  The predictive saturation signal will initially be computed as a Prometheus recording rule or gateway-exported metric (`rate(http_requests_total[30s])` combined with estimated provisioning latency \(T_{\mathrm{provision}}\)). KEDA consumes that metric through its standard Prometheus scaler.
+  The baseline and predictive policies will run as separate experimental configurations (`deploy/keda/arm2-capacity-saturation.yaml` and `deploy/keda/arm3-predictive-demand.yaml`), not simultaneous triggers in one `ScaledObject`, ensuring independent experimental attribution.
 * **Estimated Provisioning Latency — Sequential Upper-Bound Model:**
   Derived sequential delay breakdown under stated assumptions (Pre-warmed GPU Node Baseline):
   - 1. Metric Scrape Delay (Prometheus): 1.0 - 5.0 s
@@ -133,7 +136,7 @@ To provide an immediate, visually verifiable proof-of-work before executing clus
 +-------------------------------------------------------------------------------------------------------+
 | TIER 2: CITADEL INGRESS GATEWAY (Security & Telemetry Proxy)                                          |
 | - Containerized Python AsyncIO proxy daemon configured via `.env`.                                    |
-| - In-memory ephemeral decryption in `/dev/shm` tmpfs (zero disk writes).                              |
+| - In-memory ephemeral decryption in `/dev/shm` tmpfs, audited zero-persistence boundary.                              |
 | - Listens for client disconnects and triggers cancellation propagation to vLLM.                       |
 | - Exposes Prometheus `/metrics` on port 9090 (TTFT & TPOT latency histograms).                         |
 | - Injects signed `X-Citadel-Audit-Receipt` header into response stream.                               |
@@ -166,8 +169,9 @@ docker compose up --build
 ```
 Once local streaming, in-memory decryption, and signed receipt headers pass verification, the identical container images are deployed directly into Kubernetes pods (`deploy/vllm/` and `deploy/gateway/`).
 
-## 5. Engineering Integrity & Methodology Framework
+## 5. Engineering Integrity & Implementation Status Dashboard
 
+### Methodology Framework (M/D/B Classification)
 Every metric, latency figure, and throughput claim in this repository adheres to the **M/D/B Framework**:
 
 * **[M] Measured:** Empirically collected from physical execution on bare-metal hardware or live Kubernetes clusters. Accompanied by raw CSV/JSON logs in `experiments/results/`.
@@ -178,11 +182,19 @@ Every metric, latency figure, and throughput claim in this repository adheres to
 | :--- | :---: | :---: | :---: |
 | **Time to First Token (TTFT)** | $P_{95} \le 350\ \mathrm{ms}$ | Open-Loop k6 Ramping Load | **[Target Hypothesis]** *(Pending execution)* |
 | **Inter-Token Latency (TPOT)** | $P_{99} \le 35\ \mathrm{ms}$ ($> 28.5\ \text{tok/s}$) | Gateway Telemetry Exposition | **[Target Hypothesis]** *(Pending execution)* |
-| **Zero-Disk Persistence** | 0 Disk I/O to persistent storage (root fs / swap) | Linux I/O & Process Audit (`lsof`, `fuser`, swap accounting) | **[Target Hypothesis]** *(Pending audit)* |
+| **Zero-Persistence Property** | Audited zero persistence in defined paths (/tmp, /var/log, rootfs, swap) | Linux I/O & Process Audit (`lsof`, `/proc/swaps`, `/proc/<pid>/smaps`) | **[Target Hypothesis]** *(Pending audit)* |
 | **Scaling Lag Duration** | $30.5\ \mathrm{s} - 38.5\ \mathrm{s}$ (Pre-warmed Node) | Sequential Upper-Bound Model | **[D] Derived** *(To be measured via pod lifecycle timestamps)* |
 | **KV Cache Memory Footprint** | $M_{\mathrm{KV}} = 2 \times L \times H_{\mathrm{kv}} \times D \times S \times B$ | Theoretical Attention Formula ($L$=layers, $H_{kv}$=heads, $D$=dim, $S$=tokens, $B$=bytes) | **[D] Derived** *(Payload estimate; excludes block table overhead)* |
-| **PagedAttention Efficiency** | $< 4\%$ Internal Fragmentation | vLLM Architectural Specification | **[B] Borrowed** |
+| **PagedAttention Efficiency** | $< 4\%$ Internal Fragmentation | Kwon et al., SOSP 2023 | **[B] Borrowed** |
 
+### Implementation Maturity Matrix
+To prevent conflating planned specifications with operational execution, components are explicitly tracked across three development states:
+
+| Lifecycle State | Platform Components & Capabilities |
+| :--- | :--- |
+| **[Implemented]** | Declarative Kubernetes manifests (`deploy/keda/`, `deploy/gateway/`, `deploy/vllm/`), Docker Compose 3-tier local topology, Citadel Gateway cryptographic handshake and in-memory buffer wiping routines, Prometheus alerting rules (`prometheus_rules.yml`), open-loop k6 test harnesses (`experiments/k6/`), zero-persistence security audit suite (`gateway/tests/test_persistence.py`). |
+| **[Measured]** | Baseline hardware calibrations from `ai-infra-systems` on physical silicon (Roofline arithmetic intensity, memory paging, M3 Ultra vs GTX 1050 Ti vs Cloud L4). |
+| **[Planned / Testing]** | Phase 1 vLLM serving baseline on live Kubernetes cluster with empirical TTFT/TPOT verification, Phase 2 bidirectional response streaming encryption, Phase 3 client cancellation latency benchmark, Phase 6 autoscaling arm comparison under open-loop bursts. |
 ---
 
 ## 6. Repository Layout
@@ -233,7 +245,7 @@ make up
 
 ### 2. Run the Cryptographic Zero-Disk Audit
 ```bash
-# Verifies X25519 + AES-GCM decryption and confirms zero disk I/O in /dev/shm
+# Verifies X25519 + AES-GCM decryption and asserts zero plaintext persistence across /tmp, /var/log, container rootfs layers, swap (/proc/swaps), and process memory maps (/proc/<pid>/smaps)
 make test-security
 ```
 
